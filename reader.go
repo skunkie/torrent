@@ -407,27 +407,31 @@ func (r *reader) posChanged() {
 }
 
 func (r *reader) Seek(off int64, whence int) (newPos int64, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	switch whence {
 	case io.SeekStart:
 		newPos = off
-		r.mu.Lock()
 	case io.SeekCurrent:
-		r.mu.Lock()
 		newPos = r.pos + off
 	case io.SeekEnd:
 		newPos = r.length + off
-		r.mu.Lock()
 	default:
 		return 0, errors.New("bad whence")
 	}
+
+	if newPos < 0 {
+		return 0, errors.New("negative position")
+	}
+
 	if newPos != r.pos {
 		r.reading = false
 		r.pos = newPos
 		r.contiguousReadStartPos = newPos
 		r.posChanged()
 	}
-	r.mu.Unlock()
-	return
+	return newPos, nil
 }
 
 func (r *reader) logger() log.Logger {
