@@ -297,3 +297,84 @@ func TestClientDroppedTorrentAnnouncesStopped(t *testing.T) {
 	tor.Drop()
 	requireAnnounceEvent(t, events, "stopped")
 }
+
+// Re-adding a dropped torrent must announce it to its trackers again, whether
+// the dropped torrent's announces have finished or are still in flight.
+func TestClientReaddedTorrentAnnouncesStarted(t *testing.T) {
+	ih := metainfo.Hash{1, 2, 3}
+	newClient := func(t *testing.T) *Client {
+		cfg := TestingConfig(t)
+		cfg.DisableTrackers = false
+		cl, err := NewClient(cfg)
+		qt.Assert(t, qt.IsNil(err))
+		t.Cleanup(func() { cl.Close() })
+		return cl
+	}
+	add := func(cl *Client, url string) *Torrent {
+		tor, _ := cl.AddTorrentInfoHash(ih)
+		tor.AddTrackers([][]string{{url}})
+		return tor
+	}
+	announced := func(cl *Client, tor *Torrent) bool {
+		cl.lock()
+		defer cl.unlock()
+		for _, state := range tor.regularTrackerAnnounceState {
+			if !state.lastOk.Completed.IsZero() {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("after the stopped announce", func(t *testing.T) {
+		cl := newClient(t)
+		url, events := newEventTracker(t, nil)
+		tor := add(cl, url)
+		requireAnnounceEvent(t, events, "started")
+		waitUntil(t, func() bool { return announced(cl, tor) })
+		tor.Drop()
+		requireAnnounceEvent(t, events, "stopped")
+		// Nothing is left to announce for the dropped torrent, so the
+		// dispatcher forgets it.
+		waitUntil(t, func() bool {
+			cl.lock()
+			defer cl.unlock()
+			return cl.regularTrackerAnnounceDispatcher.announceData.Len() == 0
+		})
+
+		tor = add(cl, url)
+		requireAnnounceEvent(t, events, "started")
+		tor.Drop()
+		requireAnnounceEvent(t, events, "stopped")
+	})
+
+	t.Run("while the stopped announce is in flight", func(t *testing.T) {
+		cl := newClient(t)
+		url, events := newEventTracker(t, map[string]time.Duration{"stopped": 500 * time.Millisecond})
+		tor := add(cl, url)
+		requireAnnounceEvent(t, events, "started")
+		waitUntil(t, func() bool { return announced(cl, tor) })
+		tor.Drop()
+		requireAnnounceEvent(t, events, "stopped")
+
+		tor = add(cl, url)
+		requireAnnounceEvent(t, events, "started")
+		tor.Drop()
+		requireAnnounceEvent(t, events, "stopped")
+	})
+
+	t.Run("while the started announce is in flight", func(t *testing.T) {
+		cl := newClient(t)
+		url, events := newEventTracker(t, map[string]time.Duration{"started": 500 * time.Millisecond})
+		tor := add(cl, url)
+		requireAnnounceEvent(t, events, "started")
+		tor.Drop()
+
+		// The dropped torrent's announce result must not stand in for the
+		// re-added torrent, whose peers it would never receive.
+		tor = add(cl, url)
+		requireAnnounceEvent(t, events, "started")
+		tor.Drop()
+		requireAnnounceEvent(t, events, "stopped")
+	})
+}

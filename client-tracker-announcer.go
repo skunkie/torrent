@@ -440,9 +440,6 @@ func (me *regularTrackerAnnounceDispatcher) step() mytimer.TimeValue {
 }
 
 func (me *regularTrackerAnnounceDispatcher) addKey(key torrentTrackerAnnouncerKey) bool {
-	if me.announceData.ContainsKey(key) {
-		return true
-	}
 	t := me.torrentFromShortInfohash(key.ShortInfohash)
 	if t == nil {
 		// Crude, but the torrent was already dropped. We probably called AddTrackers late. The
@@ -458,6 +455,18 @@ func (me *regularTrackerAnnounceDispatcher) addKey(key torrentTrackerAnnouncerKe
 		g.MapMustAssignNew(me.announceStates, key, g.PtrTo(announceState{}))
 	}
 	t.regularTrackerAnnounceState[key] = g.MapMustGet(me.announceStates, key)
+	if me.announceData.ContainsKey(key) {
+		// The key outlived a dropped torrent with the same infohash. Start its
+		// lifecycle over, or the re-added torrent never announces Started.
+		me.resetAnnounceStateForReadd(key)
+		panicif.False(me.announceData.Update(key, func(av nextAnnounceInput) nextAnnounceInput {
+			av.torrent = me.makeTorrentInput(t)
+			av.nextAnnounceStateInput = me.makeAnnounceStateInput(key)
+			return av
+		}).Exists)
+		me.updateTimer()
+		return true
+	}
 	me.announceData.Create(key, nextAnnounceInput{
 		torrent:                me.makeTorrentInput(t),
 		nextAnnounceStateInput: me.makeAnnounceStateInput(key),
@@ -562,6 +571,13 @@ func (me *regularTrackerAnnounceDispatcher) finishedAnnounce(key torrentTrackerA
 
 func (me *regularTrackerAnnounceDispatcher) syncAnnounceState(key torrentTrackerAnnouncerKey) {
 	input := me.makeAnnounceStateInput(key)
+	if input.When.IsZero() {
+		// Nothing is left to announce for a dropped torrent, so forget the key
+		// rather than keep it in the dispatcher indexes forever.
+		me.announceData.Delete(key)
+		delete(me.announceStates, key)
+		return
+	}
 	me.announceData.UpdateOrCreate(key, func(old nextAnnounceInput) nextAnnounceInput {
 		old.nextAnnounceStateInput = input
 		return old
@@ -647,6 +663,12 @@ func (me *regularTrackerAnnounceDispatcher) singleAnnounce(
 	}
 
 	me.torrentClient.lock()
+	if t.isDropped() && me.torrentFromShortInfohash(key.ShortInfohash) != nil {
+		// The torrent was dropped and re-added while this announce ran. The
+		// re-added torrent's state was reset, so leave it to announce Started
+		// itself rather than inherit this result and lose its peers.
+		return
+	}
 	me.updateAnnounceState(key, func(state *announceState) {
 		state.Err = err
 		state.lastAttemptCompleted = now
@@ -679,6 +701,17 @@ func (me *regularTrackerAnnounceDispatcher) updateAnnounceState(
 	as := me.announceStates[key]
 	update(as)
 	me.syncAnnounceState(key)
+}
+
+// resetAnnounceStateForReadd clears the lifecycle state a dropped torrent left
+// for key, so the re-added torrent announces as new.
+func (me *regularTrackerAnnounceDispatcher) resetAnnounceStateForReadd(key torrentTrackerAnnouncerKey) {
+	me.updateAnnounceState(key, func(state *announceState) {
+		state.lastOk = lastAnnounceOk{}
+		state.Err = nil
+		state.lastAttemptCompleted = time.Time{}
+		state.sentCompleted = false
+	})
 }
 
 func (me *regularTrackerAnnounceDispatcher) getAnnounceOpts() trHttp.AnnounceOpt {
@@ -845,7 +878,7 @@ func (me *regularTrackerAnnounceDispatcher) nextAnnounceEvent(key torrentTracker
 	if !state.sentCompleted && t.sawInitiallyIncompleteData && t.haveAllPieces() {
 		return tracker.Completed, time.Now()
 	}
-	if lastOk.Completed.IsZero() {
+	if lastOk.Completed.IsZero() || lastOk.AnnouncedEvent == tracker.Stopped {
 		// Returning now should be fine as sorting should occur on "overdue" derived value.
 		return tracker.Started, time.Now()
 	}
